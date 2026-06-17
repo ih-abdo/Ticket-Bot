@@ -2,8 +2,10 @@ import os
 import discord
 from discord.ext import commands, tasks
 import aiohttp
+from aiohttp import web # إضافة مكتبة خادم الويب
 import aiosqlite
 import datetime
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,8 +14,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 BOOTSTRAP_CHANNEL_ID = int(os.getenv("CHANNEL_BOOTSTRAP_ID"))
-PENDING_CHANNEL_ID = int(os.getenv("CHANNEL_NEW_TICKETS_ID")) # القناة ب: قيد الانتظار
-IN_PROGRESS_CHANNEL_ID = int(os.getenv("CHANNEL_IN_PROGRESS_ID")) # القناة ج: قيد العمل
+PENDING_CHANNEL_ID = int(os.getenv("CHANNEL_NEW_TICKETS_ID"))
+IN_PROGRESS_CHANNEL_ID = int(os.getenv("CHANNEL_IN_PROGRESS_ID"))
 DONE_CHANNEL_ID = int(os.getenv("CHANNEL_DONE_ID"))
 ARCHIVE_CHANNEL_ID = int(os.getenv("CHANNEL_ARCHIVE_ID"))
 ADMIN_ROLE_ID = int(os.getenv("ROLE_ADMIN_ID"))
@@ -28,7 +30,25 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 DB_FILE = "gestax_system.db"
 
 # --------------------------------------------------------
-# 🗄️ إعداد قاعدة البيانات (انتبه من فقدانها على رندر المجاني)
+# 🌐 [الـخـدعـة] خادم ويب وهمي لخداع Render
+# --------------------------------------------------------
+async def fake_web_server():
+    app = web.Application()
+    # عندما تزور منصة Render أو أي شخص رابط البوت، سيظهر هذا النص فقط
+    app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive and Running! 🚀 (Render Trick Active)"))
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # منصة رندر تجبرنا على استخدام المنفذ الذي تحدده هي في متغيرات البيئة
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    
+    await site.start()
+    print(f"🌐 [HACK] Fake Web Server is listening on port {port} to trick Render!")
+
+# --------------------------------------------------------
+# 🗄️ إعداد قاعدة البيانات
 # --------------------------------------------------------
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
@@ -78,11 +98,7 @@ class GitHubAPI:
 class TicketCreationModal(discord.ui.Modal, title="فتح تذكرة مهام جديدة"):
     ticket_title = discord.ui.TextInput(label="عنوان المهمة", placeholder="مثال: تصميم واجهة الدفع...")
     ticket_desc = discord.ui.TextInput(label="تفاصيل المهمة المطلوبة", style=discord.TextStyle.long)
-    ticket_type = discord.ui.TextInput(
-        label="التصنيف (إدارية، برمجية، تصميم، أخرى)", 
-        placeholder="اكتب نوع التذكرة هنا...", 
-        max_length=20
-    )
+    ticket_type = discord.ui.TextInput(label="التصنيف (إدارية، برمجية، تصميم، أخرى)", placeholder="اكتب نوع التذكرة هنا...", max_length=20)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -98,7 +114,7 @@ class TicketCreationModal(discord.ui.Modal, title="فتح تذكرة مهام ج
         embed = discord.Embed(
             title=f"⏳ تذكرة قيد الانتظار #{issue_num} | {t_type}",
             description=f"**العنوان:** {self.ticket_title.value}\n\n**الوصف:** {self.ticket_desc.value}",
-            color=discord.Color.gold() # لون أصفر ذهبي للانتظار
+            color=discord.Color.gold()
         )
         embed.add_field(name="المنشئ", value=interaction.user.mention, inline=True)
         embed.add_field(name="الحالة العامة", value="⏸️ قيد الانتظار (في طابور المهام)", inline=True)
@@ -137,7 +153,7 @@ class SuspendModal(discord.ui.Modal, title="سبب تعليق التذكرة"):
                 embed = discord.Embed(
                     title=f"🛑 تذكرة معلقة #{issue_num} | {t_type}",
                     description=f"**العنوان:** {title}\n\n**الوصف:** {desc}",
-                    color=discord.Color.red() # أحمر للتعليق القسري
+                    color=discord.Color.red()
                 )
                 creator_user = interaction.guild.get_member(creator_id)
                 assignee_user = interaction.guild.get_member(assignee_id) if assignee_id else None
@@ -346,8 +362,14 @@ async def on_ready():
     await init_db()
     bot.add_view(InitialTicketBootstrapView())
     bot.add_view(PersistentTicketOpsView())
+    
+    # تشغيل مهمة الأرشفة التلقائية
     if not archive_old_tickets_task.is_running():
         archive_old_tickets_task.start()
+        
+    # تشغيل خادم الويب الوهمي في الخلفية لخداع Render
+    bot.loop.create_task(fake_web_server())
+    
     print(f"🔥 النظام أونلاين ومستعد للعمل. البوت: {bot.user}")
 
 @bot.command()
