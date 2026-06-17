@@ -155,9 +155,14 @@ class SuspendModal(discord.ui.Modal, title="سبب تعليق التذكرة"):
 # --------------------------------------------------------
 # 👥 قوائم التعيين والثريدات
 # --------------------------------------------------------
-class AssigneeSelect(discord.ui.UserSelect, placeholder="اختر العضو لتسليمه هذه المهمة..."):
+class AssigneeSelect(discord.ui.UserSelect):
     def __init__(self, msg_id: int):
-        super().__init__(custom_id=f"assign_select_menu:{msg_id}", min_values=1, max_values=1)
+        super().__init__(
+            custom_id=f"assign_select_menu:{msg_id}", 
+            placeholder="اختر العضو لتسليمه هذه المهمة...",
+            min_values=1, 
+            max_values=1
+        )
         self.msg_id = msg_id
 
     async def callback(self, interaction: discord.Interaction):
