@@ -3,7 +3,7 @@ import discord
 from discord.ext import commands, tasks
 import aiohttp
 from aiohttp import web 
-import aiosqlite
+import motor.motor_asyncio
 import datetime
 import asyncio
 from dotenv import load_dotenv
@@ -13,6 +13,8 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
+MONGO_URI = os.getenv("MONGO_URI")
+
 BOOTSTRAP_CHANNEL_ID = int(os.getenv("CHANNEL_BOOTSTRAP_ID"))
 PENDING_CHANNEL_ID = int(os.getenv("CHANNEL_NEW_TICKETS_ID"))
 IN_PROGRESS_CHANNEL_ID = int(os.getenv("CHANNEL_IN_PROGRESS_ID"))
@@ -28,44 +30,30 @@ intents.guilds = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-DB_FILE = "gestax_system.db"
 
-# رمز المحاذاة من اليمين لليسار (سري وخفي)
+# --------------------------------------------------------
+# 🗄️ إعداد MongoDB
+# --------------------------------------------------------
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["gestax_system"]
+tickets_collection = db["tickets"]
+
+# حيل العرض والتنسيق
 RTL = "\u202b"
+WIDTH_HACK = "\u2800" * 45  # مسافات مخفية لإجبار البطاقة على التمدد أفقياً
 
 # --------------------------------------------------------
 # 🌐 خادم الويب الوهمي لـ Render
 # --------------------------------------------------------
 async def fake_web_server():
     app = web.Application()
-    app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive! 🚀 (Render Trick Active)"))
+    app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive! 🚀 (MongoDB Active)"))
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"🌐 [HACK] Fake Web Server is listening on port {port} to trick Render!")
-
-# --------------------------------------------------------
-# 🗄️ قاعدة البيانات
-# --------------------------------------------------------
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS tickets (
-                discord_msg_id INTEGER PRIMARY KEY,
-                github_issue_num INTEGER,
-                creator_id INTEGER,
-                assignee_id INTEGER,
-                thread_id INTEGER,
-                status TEXT,
-                ticket_type TEXT,
-                title TEXT,
-                description TEXT,
-                dod TEXT DEFAULT 'غير محدد'
-            )
-        ''')
-        await db.commit()
 
 # --------------------------------------------------------
 # 🐙 GitHub API
@@ -92,7 +80,7 @@ class GitHubAPI:
                 return resp.status == 200
 
 # --------------------------------------------------------
-# 📝 الاستمارات (تصميم احترافي وRTL)
+# 📝 الاستمارات (تصميم أوسع + خطوط ضخمة)
 # --------------------------------------------------------
 class TicketCreationModal(discord.ui.Modal):
     def __init__(self, selected_type: str, is_custom: bool):
@@ -126,23 +114,31 @@ class TicketCreationModal(discord.ui.Modal):
         
         embed = discord.Embed(
             title=f"{RTL} ⏳ تذكرة #{issue_num} | {self.ticket_title.value}",
-            description=f"{RTL}**القسم:** {final_type}\n\n{RTL}**الوصف:**\n> {self.ticket_desc.value}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {self.ticket_dod.value}",
-            color=0xF1C40F # أصفر ذهبي نقي
+            description=f"{RTL}**القسم:** {final_type}\n\n{RTL}# الوصف:\n{self.ticket_desc.value}\n\n{RTL}# 🎯 متطلبات الإنهاء (DoD):\n{self.ticket_dod.value}",
+            color=0xF1C40F
         )
-        # استخدام الـ Author يعطي شكلاً احترافياً جداً
         avatar_url = interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url
         embed.set_author(name=f"بواسطة: {interaction.user.display_name}", icon_url=avatar_url)
-        embed.set_footer(text="Gestax HQ • Pending", icon_url="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png")
+        embed.set_footer(text=f"Gestax HQ • Pending{WIDTH_HACK}", icon_url="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png")
         
         pending_channel = bot.get_channel(PENDING_CHANNEL_ID)
         msg = await pending_channel.send(embed=embed, view=PersistentTicketOpsView())
         
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(
-                "INSERT INTO tickets (discord_msg_id, github_issue_num, creator_id, assignee_id, thread_id, status, ticket_type, title, description, dod) VALUES (?, ?, ?, NULL, NULL, 'PENDING', ?, ?, ?, ?)",
-                (msg.id, issue_num, interaction.user.id, final_type, self.ticket_title.value, self.ticket_desc.value, self.ticket_dod.value)
-            )
-            await db.commit()
+        # حفظ في MongoDB
+        ticket_data = {
+            "discord_msg_id": msg.id,
+            "github_issue_num": issue_num,
+            "creator_id": interaction.user.id,
+            "assignee_id": None,
+            "thread_id": None,
+            "status": "PENDING",
+            "ticket_type": final_type,
+            "title": self.ticket_title.value,
+            "description": self.ticket_desc.value,
+            "dod": self.ticket_dod.value,
+            "created_at": datetime.datetime.now(datetime.timezone.utc)
+        }
+        await tickets_collection.insert_one(ticket_data)
 
         await interaction.followup.send("✅ تم إرسال التذكرة بنجاح.", ephemeral=True)
 
@@ -162,7 +158,6 @@ class TicketTypeSelect(discord.ui.Select):
         if is_custom and not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
             await interaction.response.send_message("❌ عذراً، هذا الخيار للإدارة العليا فقط.", ephemeral=True)
             return
-
         await interaction.response.send_modal(TicketCreationModal(selected_type=val, is_custom=is_custom))
 
 class TicketTypeSelectView(discord.ui.View):
@@ -178,42 +173,42 @@ class SuspendModal(discord.ui.Modal, title="سبب تعليق التذكرة"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT github_issue_num, creator_id, ticket_type, title, description, assignee_id, dod, thread_id FROM tickets WHERE discord_msg_id = ?", (self.msg_id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row: return
-                issue_num, creator_id, t_type, title, desc, assignee_id, dod, thread_id = row
+        ticket = await tickets_collection.find_one({"discord_msg_id": self.msg_id})
+        if not ticket: return
 
-                embed = discord.Embed(
-                    title=f"{RTL} 🛑 معلقة #{issue_num} | {title}", 
-                    description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}\n\n{RTL}**⚠️ سبب الإيقاف:**\n> {self.reason.value}", 
-                    color=0xE74C3C # أحمر نقي
-                )
-                
-                creator_user = interaction.guild.get_member(creator_id)
-                avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
-                embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
-                
-                assignee_user = interaction.guild.get_member(assignee_id) if assignee_id else None
-                if assignee_user:
-                    embed.add_field(name=f"{RTL}المطور المسؤول", value=assignee_user.mention, inline=False)
+        embed = discord.Embed(
+            title=f"{RTL} 🛑 معلقة #{ticket['github_issue_num']} | {ticket['title']}", 
+            description=f"{RTL}**القسم:** {ticket['ticket_type']}\n\n{RTL}# الوصف:\n{ticket['description']}\n\n{RTL}# 🎯 متطلبات الإنهاء (DoD):\n{ticket['dod']}\n\n{RTL}# ⚠️ سبب الإيقاف:\n{self.reason.value}", 
+            color=0xE74C3C
+        )
+        
+        creator_user = interaction.guild.get_member(ticket['creator_id'])
+        avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
+        embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
+        
+        if ticket['assignee_id']:
+            assignee_user = interaction.guild.get_member(ticket['assignee_id'])
+            if assignee_user:
+                embed.add_field(name=f"{RTL}المطور المسؤول", value=assignee_user.mention, inline=False)
 
-                embed.set_footer(text="Gestax HQ • Suspended")
-                
-                suspended_channel = bot.get_channel(SUSPENDED_CHANNEL_ID)
-                new_msg = await suspended_channel.send(embed=embed, view=SuspendedTicketOpsView())
-                
-                await db.execute("UPDATE tickets SET discord_msg_id = ?, status = 'SUSPENDED' WHERE discord_msg_id = ?", (new_msg.id, self.msg_id))
-                await db.commit()
-                
-                if thread_id:
-                    try:
-                        thread = interaction.guild.get_thread(thread_id)
-                        if thread: await thread.send("🛑 **تنبيه:** تم تعليق العمل على هذه المهمة ونقلها للانتظار.")
-                    except: pass
+        embed.set_footer(text=f"Gestax HQ • Suspended{WIDTH_HACK}")
+        
+        suspended_channel = bot.get_channel(SUSPENDED_CHANNEL_ID)
+        new_msg = await suspended_channel.send(embed=embed, view=SuspendedTicketOpsView())
+        
+        # التحديث في MongoDB
+        await tickets_collection.update_one(
+            {"discord_msg_id": self.msg_id},
+            {"$set": {"discord_msg_id": new_msg.id, "status": "SUSPENDED"}}
+        )
+        
+        if ticket['thread_id']:
+            try:
+                thread = interaction.guild.get_thread(ticket['thread_id'])
+                if thread: await thread.send("🛑 **تنبيه:** تم تعليق العمل على هذه المهمة ونقلها للانتظار.")
+            except: pass
 
-                await interaction.message.delete()
-                
+        await interaction.message.delete()
         await interaction.followup.send("⏸️ تم نقل التذكرة لقناة (التذاكر المعلقة).", ephemeral=True)
 
 # --------------------------------------------------------
@@ -233,48 +228,50 @@ class AssigneeSelect(discord.ui.UserSelect):
             await interaction.followup.send("❌ لا يمكنك تعيين روبوت/بوت لهذه المهمة! اختر مطوراً بشرياً.", ephemeral=True)
             return
 
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT github_issue_num, creator_id, ticket_type, title, description, thread_id, status, dod FROM tickets WHERE discord_msg_id = ?", (self.msg_id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row: return
-                issue_num, creator_id, t_type, title, desc, thread_id, status, dod = row
+        ticket = await tickets_collection.find_one({"discord_msg_id": self.msg_id})
+        if not ticket: return
 
-            work_embed = discord.Embed(
-                title=f"{RTL} 👨‍💻 قيد العمل #{issue_num} | {title}", 
-                description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}", 
-                color=0x3498DB # أزرق نقي
-            )
-            
-            creator_user = interaction.guild.get_member(creator_id)
-            avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
-            work_embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
-            work_embed.add_field(name=f"{RTL}المستلم", value=assigned_developer.mention, inline=False)
-            work_embed.set_footer(text="Gestax HQ • In Progress")
-            
-            if thread_id and status in ['IN_PROGRESS', 'SUSPENDED']:
-                thread = interaction.guild.get_thread(thread_id)
-                if thread:
-                    await thread.add_user(assigned_developer)
-                    await thread.send(f"🔄 **تحديث المهمة:** تم تسليم هذه التذكرة للمطور {assigned_developer.mention}.")
-                await interaction.message.edit(embed=work_embed)
-                await db.execute("UPDATE tickets SET assignee_id = ?, status = 'IN_PROGRESS' WHERE discord_msg_id = ?", (assigned_developer.id, self.msg_id))
-                await interaction.followup.send("🔄 تم تحديث المطور.", ephemeral=True)
-            else:
-                in_progress_channel = bot.get_channel(IN_PROGRESS_CHANNEL_ID)
-                new_msg = await in_progress_channel.send(embed=work_embed, view=PersistentTicketOpsView())
-                thread = await in_progress_channel.create_thread(name=f"🔒-عمل-تذكرة-{issue_num}", type=discord.ChannelType.private_thread, auto_archive_duration=1440)
-                
-                await thread.add_user(interaction.user)
-                if creator_id: await thread.add_user(interaction.guild.get_member(creator_id))
+        work_embed = discord.Embed(
+            title=f"{RTL} 👨‍💻 قيد العمل #{ticket['github_issue_num']} | {ticket['title']}", 
+            description=f"{RTL}**القسم:** {ticket['ticket_type']}\n\n{RTL}# الوصف:\n{ticket['description']}\n\n{RTL}# 🎯 متطلبات الإنهاء (DoD):\n{ticket['dod']}", 
+            color=0x3498DB
+        )
+        
+        creator_user = interaction.guild.get_member(ticket['creator_id'])
+        avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
+        work_embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
+        work_embed.add_field(name=f"{RTL}المستلم", value=assigned_developer.mention, inline=False)
+        work_embed.set_footer(text=f"Gestax HQ • In Progress{WIDTH_HACK}")
+        
+        if ticket['thread_id'] and ticket['status'] in ['IN_PROGRESS', 'SUSPENDED']:
+            thread = interaction.guild.get_thread(ticket['thread_id'])
+            if thread:
                 await thread.add_user(assigned_developer)
-                await thread.send(f"⚠️ **مساحة عمل سرية:** تم عزل هذه الغرفة لمناقشة التذكرة رقم #{issue_num}.")
+                await thread.send(f"🔄 **تحديث المهمة:** تم تسليم هذه التذكرة للمطور {assigned_developer.mention}.")
+            await interaction.message.edit(embed=work_embed)
+            await tickets_collection.update_one(
+                {"discord_msg_id": self.msg_id},
+                {"$set": {"assignee_id": assigned_developer.id, "status": "IN_PROGRESS"}}
+            )
+            await interaction.followup.send("🔄 تم تحديث المطور.", ephemeral=True)
+        else:
+            in_progress_channel = bot.get_channel(IN_PROGRESS_CHANNEL_ID)
+            new_msg = await in_progress_channel.send(embed=work_embed, view=PersistentTicketOpsView())
+            thread = await in_progress_channel.create_thread(name=f"🔒-عمل-تذكرة-{ticket['github_issue_num']}", type=discord.ChannelType.private_thread, auto_archive_duration=1440)
+            
+            await thread.add_user(interaction.user)
+            if ticket['creator_id']: await thread.add_user(interaction.guild.get_member(ticket['creator_id']))
+            await thread.add_user(assigned_developer)
+            await thread.send(f"⚠️ **مساحة عمل سرية:** تم عزل هذه الغرفة لمناقشة التذكرة رقم #{ticket['github_issue_num']}.")
 
-                await db.execute("UPDATE tickets SET discord_msg_id = ?, assignee_id = ?, thread_id = ?, status = 'IN_PROGRESS' WHERE discord_msg_id = ?", (new_msg.id, assigned_developer.id, thread.id, self.msg_id))
-                try:
-                    await interaction.message.delete()
-                except Exception: pass
-                await interaction.followup.send("🎯 تم نقل التذكرة لقناة (قيد العمل) وتأسيس الغرفة.", ephemeral=True)
-            await db.commit()
+            await tickets_collection.update_one(
+                {"discord_msg_id": self.msg_id},
+                {"$set": {"discord_msg_id": new_msg.id, "assignee_id": assigned_developer.id, "thread_id": thread.id, "status": "IN_PROGRESS"}}
+            )
+            try:
+                await interaction.message.delete()
+            except Exception: pass
+            await interaction.followup.send("🎯 تم نقل التذكرة لقناة (قيد العمل) وتأسيس الغرفة.", ephemeral=True)
 
 class AssigneeSelectView(discord.ui.View):
     def __init__(self, msg_id: int):
@@ -291,35 +288,34 @@ class SuspendedTicketOpsView(discord.ui.View):
     @discord.ui.button(label="نزع التعليق 🔙", style=discord.ButtonStyle.primary, custom_id="btn_unsuspend")
     async def unsuspend_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT github_issue_num, creator_id, ticket_type, title, description, dod, thread_id FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row: return
-                issue_num, creator_id, t_type, title, desc, dod, thread_id = row
+        ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
+        if not ticket: return
 
-            embed = discord.Embed(
-                title=f"{RTL} ⏳ تذكرة #{issue_num} | {title}",
-                description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}",
-                color=0xF1C40F
-            )
-            creator_user = interaction.guild.get_member(creator_id)
-            avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
-            embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
-            embed.set_footer(text="Gestax HQ • Pending")
-            
-            pending_channel = bot.get_channel(PENDING_CHANNEL_ID)
-            new_msg = await pending_channel.send(embed=embed, view=PersistentTicketOpsView())
+        embed = discord.Embed(
+            title=f"{RTL} ⏳ تذكرة #{ticket['github_issue_num']} | {ticket['title']}",
+            description=f"{RTL}**القسم:** {ticket['ticket_type']}\n\n{RTL}# الوصف:\n{ticket['description']}\n\n{RTL}# 🎯 متطلبات الإنهاء (DoD):\n{ticket['dod']}",
+            color=0xF1C40F
+        )
+        creator_user = interaction.guild.get_member(ticket['creator_id'])
+        avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
+        embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
+        embed.set_footer(text=f"Gestax HQ • Pending{WIDTH_HACK}")
+        
+        pending_channel = bot.get_channel(PENDING_CHANNEL_ID)
+        new_msg = await pending_channel.send(embed=embed, view=PersistentTicketOpsView())
 
-            if thread_id:
-                try:
-                    thread = interaction.guild.get_thread(thread_id)
-                    if thread: await thread.send("▶️ **تنبيه:** تم نزع التعليق عن المهمة، يمكنكم مواصلة العمل الآن.")
-                except: pass
+        if ticket['thread_id']:
+            try:
+                thread = interaction.guild.get_thread(ticket['thread_id'])
+                if thread: await thread.send("▶️ **تنبيه:** تم نزع التعليق عن المهمة، يمكنكم مواصلة العمل الآن.")
+            except: pass
 
-            await db.execute("UPDATE tickets SET discord_msg_id = ?, status = 'PENDING' WHERE discord_msg_id = ?", (new_msg.id, interaction.message.id))
-            await db.commit()
-            await interaction.message.delete()
-            await interaction.followup.send("🔙 تم إعادة التذكرة لقناة (قيد الانتظار).", ephemeral=True)
+        await tickets_collection.update_one(
+            {"discord_msg_id": interaction.message.id},
+            {"$set": {"discord_msg_id": new_msg.id, "status": "PENDING"}}
+        )
+        await interaction.message.delete()
+        await interaction.followup.send("🔙 تم إعادة التذكرة لقناة (قيد الانتظار).", ephemeral=True)
 
     @discord.ui.button(label="إغلاق إجباري ❌", style=discord.ButtonStyle.danger, custom_id="btn_suspend_force_close")
     async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -327,21 +323,17 @@ class SuspendedTicketOpsView(discord.ui.View):
             await interaction.response.send_message("❌ للإدارة فقط.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT github_issue_num, thread_id FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,)) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    issue_num, thread_id = row
-                    await GitHubAPI.close_issue(issue_num)
-                    if thread_id:
-                        try:
-                            thread = interaction.guild.get_thread(thread_id)
-                            if thread: await thread.edit(archived=True, locked=True)
-                        except Exception: pass
-                    await db.execute("DELETE FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,))
-                    await db.commit()
-                    await interaction.message.delete()
-                    await interaction.followup.send("🗑️ تم حذف التذكرة.", ephemeral=True)
+        ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
+        if ticket:
+            await GitHubAPI.close_issue(ticket['github_issue_num'])
+            if ticket['thread_id']:
+                try:
+                    thread = interaction.guild.get_thread(ticket['thread_id'])
+                    if thread: await thread.edit(archived=True, locked=True)
+                except Exception: pass
+            await tickets_collection.delete_one({"discord_msg_id": interaction.message.id})
+            await interaction.message.delete()
+            await interaction.followup.send("🗑️ تم حذف التذكرة.", ephemeral=True)
 
 # --------------------------------------------------------
 # 🔘 أزرار التذاكر المنتهية والأرشيف
@@ -357,9 +349,7 @@ class DoneTicketOpsView(discord.ui.View):
             return
         archive_channel = bot.get_channel(ARCHIVE_CHANNEL_ID)
         await archive_channel.send(embed=interaction.message.embeds[0])
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("DELETE FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,))
-            await db.commit()
+        await tickets_collection.delete_one({"discord_msg_id": interaction.message.id})
         await interaction.message.delete()
         await interaction.response.send_message("📁 تم نقل التذكرة للأرشيف.", ephemeral=True)
 
@@ -381,41 +371,40 @@ class PersistentTicketOpsView(discord.ui.View):
     @discord.ui.button(label="إنهاء ✅", style=discord.ButtonStyle.success, custom_id="btn_mark_done")
     async def mark_done(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT github_issue_num, thread_id, title, description, ticket_type, assignee_id, dod FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row: return
-                issue_num, thread_id, title, desc, t_type, assignee_id, dod = row
+        ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
+        if not ticket: return
 
-            is_admin = any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
-            if not is_admin and interaction.user.id != assignee_id:
-                await interaction.followup.send("❌ فقط المطور المسؤول أو الإدارة يحق لهم إنهاء هذه المهمة.", ephemeral=True)
-                return
+        is_admin = any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
+        if not is_admin and interaction.user.id != ticket['assignee_id']:
+            await interaction.followup.send("❌ فقط المطور المسؤول أو الإدارة يحق لهم إنهاء هذه المهمة.", ephemeral=True)
+            return
 
-            await GitHubAPI.close_issue(issue_num)
-            done_channel = bot.get_channel(DONE_CHANNEL_ID)
-            
-            done_embed = discord.Embed(
-                title=f"{RTL} 🎉 مكتملة #{issue_num} | {title}", 
-                description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}", 
-                color=0x2ECC71 # أخضر نقي
-            )
-            done_embed.set_footer(text=f"Gestax HQ • Completed • {datetime.datetime.now().strftime('%Y-%m-%d')}")
-            
-            new_msg = await done_channel.send(embed=done_embed, view=DoneTicketOpsView())
+        await GitHubAPI.close_issue(ticket['github_issue_num'])
+        done_channel = bot.get_channel(DONE_CHANNEL_ID)
+        
+        done_embed = discord.Embed(
+            title=f"{RTL} 🎉 مكتملة #{ticket['github_issue_num']} | {ticket['title']}", 
+            description=f"{RTL}**القسم:** {ticket['ticket_type']}\n\n{RTL}# الوصف:\n{ticket['description']}\n\n{RTL}# 🎯 متطلبات الإنهاء (DoD):\n{ticket['dod']}", 
+            color=0x2ECC71
+        )
+        done_embed.set_footer(text=f"Gestax HQ • Completed • {datetime.datetime.now().strftime('%Y-%m-%d')}{WIDTH_HACK}")
+        
+        new_msg = await done_channel.send(embed=done_embed, view=DoneTicketOpsView())
 
-            if thread_id:
-                try:
-                    thread = interaction.guild.get_thread(thread_id)
-                    if thread:
-                        await thread.send("🔒 **مكتمل:** تم إنهاء المهمة وقفل الغرفة بنجاح.")
-                        await thread.edit(archived=True, locked=True)
-                except Exception: pass
+        if ticket['thread_id']:
+            try:
+                thread = interaction.guild.get_thread(ticket['thread_id'])
+                if thread:
+                    await thread.send("🔒 **مكتمل:** تم إنهاء المهمة وقفل الغرفة بنجاح.")
+                    await thread.edit(archived=True, locked=True)
+            except Exception: pass
 
-            await db.execute("UPDATE tickets SET discord_msg_id = ?, status = 'DONE' WHERE discord_msg_id = ?", (new_msg.id, interaction.message.id))
-            await db.commit()
-            await interaction.message.delete()
-            await interaction.followup.send("✅ تم اعتماد التذكرة ونقلها لقناة المكتملة.", ephemeral=True)
+        await tickets_collection.update_one(
+            {"discord_msg_id": interaction.message.id},
+            {"$set": {"discord_msg_id": new_msg.id, "status": "DONE"}}
+        )
+        await interaction.message.delete()
+        await interaction.followup.send("✅ تم اعتماد التذكرة ونقلها لقناة المكتملة.", ephemeral=True)
 
     @discord.ui.button(label="إغلاق ❌", style=discord.ButtonStyle.danger, custom_id="btn_global_force_close")
     async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -423,21 +412,17 @@ class PersistentTicketOpsView(discord.ui.View):
             await interaction.response.send_message("❌ للإدارة فقط.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT github_issue_num, thread_id FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,)) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    issue_num, thread_id = row
-                    await GitHubAPI.close_issue(issue_num)
-                    if thread_id:
-                        try:
-                            thread = interaction.guild.get_thread(thread_id)
-                            if thread: await thread.edit(archived=True, locked=True)
-                        except Exception: pass
-                    await db.execute("DELETE FROM tickets WHERE discord_msg_id = ?", (interaction.message.id,))
-                    await db.commit()
-                    await interaction.message.delete()
-                    await interaction.followup.send("🗑️ تم حذف التذكرة.", ephemeral=True)
+        ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
+        if ticket:
+            await GitHubAPI.close_issue(ticket['github_issue_num'])
+            if ticket['thread_id']:
+                try:
+                    thread = interaction.guild.get_thread(ticket['thread_id'])
+                    if thread: await thread.edit(archived=True, locked=True)
+                except Exception: pass
+            await tickets_collection.delete_one({"discord_msg_id": interaction.message.id})
+            await interaction.message.delete()
+            await interaction.followup.send("🗑️ تم حذف التذكرة.", ephemeral=True)
 
 class InitialTicketBootstrapView(discord.ui.View):
     def __init__(self):
@@ -460,9 +445,7 @@ async def archive_old_tickets_task():
         if (now - message.created_at).days >= 7:
             if message.embeds:
                 await archive_channel.send(embed=message.embeds[0])
-                async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute("DELETE FROM tickets WHERE discord_msg_id = ?", (message.id,))
-                    await db.commit()
+                await tickets_collection.delete_one({"discord_msg_id": message.id})
                 await message.delete()
 
 # --------------------------------------------------------
@@ -470,7 +453,6 @@ async def archive_old_tickets_task():
 # --------------------------------------------------------
 @bot.event
 async def on_ready():
-    await init_db()
     bot.add_view(InitialTicketBootstrapView())
     bot.add_view(PersistentTicketOpsView())
     bot.add_view(DoneTicketOpsView())
@@ -478,7 +460,7 @@ async def on_ready():
     
     if not archive_old_tickets_task.is_running(): archive_old_tickets_task.start()
     bot.loop.create_task(fake_web_server())
-    print(f"🔥 النظام المدمّر أونلاين ومستعد للعمل. البوت: {bot.user}")
+    print(f"🔥 النظام المدمّر أونلاين، تم ربط قاعدة بيانات MongoDB بنجاح! البوت: {bot.user}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
