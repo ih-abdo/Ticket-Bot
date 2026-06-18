@@ -16,7 +16,7 @@ GITHUB_REPO = os.getenv("GITHUB_REPO")
 BOOTSTRAP_CHANNEL_ID = int(os.getenv("CHANNEL_BOOTSTRAP_ID"))
 PENDING_CHANNEL_ID = int(os.getenv("CHANNEL_NEW_TICKETS_ID"))
 IN_PROGRESS_CHANNEL_ID = int(os.getenv("CHANNEL_IN_PROGRESS_ID"))
-SUSPENDED_CHANNEL_ID = int(os.getenv("CHANNEL_SUSPENDED_ID")) # القناة الجديدة
+SUSPENDED_CHANNEL_ID = int(os.getenv("CHANNEL_SUSPENDED_ID")) 
 DONE_CHANNEL_ID = int(os.getenv("CHANNEL_DONE_ID"))
 ARCHIVE_CHANNEL_ID = int(os.getenv("CHANNEL_ARCHIVE_ID"))
 ADMIN_ROLE_ID = int(os.getenv("ROLE_ADMIN_ID"))
@@ -29,6 +29,9 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 DB_FILE = "gestax_system.db"
+
+# رمز المحاذاة من اليمين لليسار (سري وخفي)
+RTL = "\u202b"
 
 # --------------------------------------------------------
 # 🌐 خادم الويب الوهمي لـ Render
@@ -89,7 +92,7 @@ class GitHubAPI:
                 return resp.status == 200
 
 # --------------------------------------------------------
-# 📝 الاستمارات (مع تكبير الخط وإزالة الحالة)
+# 📝 الاستمارات (تصميم احترافي وRTL)
 # --------------------------------------------------------
 class TicketCreationModal(discord.ui.Modal):
     def __init__(self, selected_type: str, is_custom: bool):
@@ -121,13 +124,15 @@ class TicketCreationModal(discord.ui.Modal):
             await interaction.followup.send("❌ فشل فتح التذكرة في جيتهاب.", ephemeral=True)
             return
         
-        # استخدام ### لتكبير الخط بشكل ملحوظ داخل الـ Embed
         embed = discord.Embed(
-            title=f"⏳ #{issue_num} | {final_type} | {self.ticket_title.value}",
-            description=f"### الوصف:\n{self.ticket_desc.value}\n\n### 🎯 متطلبات الإنهاء (DoD):\n{self.ticket_dod.value}",
-            color=discord.Color.gold()
+            title=f"{RTL} ⏳ تذكرة #{issue_num} | {self.ticket_title.value}",
+            description=f"{RTL}**القسم:** {final_type}\n\n{RTL}**الوصف:**\n> {self.ticket_desc.value}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {self.ticket_dod.value}",
+            color=0xF1C40F # أصفر ذهبي نقي
         )
-        embed.add_field(name="المنشئ", value=interaction.user.mention, inline=False)
+        # استخدام الـ Author يعطي شكلاً احترافياً جداً
+        avatar_url = interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url
+        embed.set_author(name=f"بواسطة: {interaction.user.display_name}", icon_url=avatar_url)
+        embed.set_footer(text="Gestax HQ • Pending", icon_url="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png")
         
         pending_channel = bot.get_channel(PENDING_CHANNEL_ID)
         msg = await pending_channel.send(embed=embed, view=PersistentTicketOpsView())
@@ -180,18 +185,22 @@ class SuspendModal(discord.ui.Modal, title="سبب تعليق التذكرة"):
                 issue_num, creator_id, t_type, title, desc, assignee_id, dod, thread_id = row
 
                 embed = discord.Embed(
-                    title=f"🛑 #{issue_num} | {t_type} | {title}", 
-                    description=f"### الوصف:\n{desc}\n\n### 🎯 متطلبات الإنهاء (DoD):\n{dod}\n\n### ⚠️ سبب الإيقاف:\n{self.reason.value}", 
-                    color=discord.Color.red()
+                    title=f"{RTL} 🛑 معلقة #{issue_num} | {title}", 
+                    description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}\n\n{RTL}**⚠️ سبب الإيقاف:**\n> {self.reason.value}", 
+                    color=0xE74C3C # أحمر نقي
                 )
-                creator_user = interaction.guild.get_member(creator_id)
-                assignee_user = interaction.guild.get_member(assignee_id) if assignee_id else None
                 
-                embed.add_field(name="المنشئ", value=creator_user.mention if creator_user else "غير معروف", inline=True)
-                embed.add_field(name="المطور المسؤول", value=assignee_user.mention if assignee_user else "غير محدد", inline=True)
+                creator_user = interaction.guild.get_member(creator_id)
+                avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
+                embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
+                
+                assignee_user = interaction.guild.get_member(assignee_id) if assignee_id else None
+                if assignee_user:
+                    embed.add_field(name=f"{RTL}المطور المسؤول", value=assignee_user.mention, inline=False)
+
+                embed.set_footer(text="Gestax HQ • Suspended")
                 
                 suspended_channel = bot.get_channel(SUSPENDED_CHANNEL_ID)
-                # إرسال الرسالة إلى قناة المعلقة مع الأزرار الخاصة بها
                 new_msg = await suspended_channel.send(embed=embed, view=SuspendedTicketOpsView())
                 
                 await db.execute("UPDATE tickets SET discord_msg_id = ?, status = 'SUSPENDED' WHERE discord_msg_id = ?", (new_msg.id, self.msg_id))
@@ -231,11 +240,16 @@ class AssigneeSelect(discord.ui.UserSelect):
                 issue_num, creator_id, t_type, title, desc, thread_id, status, dod = row
 
             work_embed = discord.Embed(
-                title=f"👨‍💻 #{issue_num} | {t_type} | {title}", 
-                description=f"### الوصف:\n{desc}\n\n### 🎯 متطلبات الإنهاء (DoD):\n{dod}", 
-                color=discord.Color.blue()
+                title=f"{RTL} 👨‍💻 قيد العمل #{issue_num} | {title}", 
+                description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}", 
+                color=0x3498DB # أزرق نقي
             )
-            work_embed.add_field(name="المستلم", value=assigned_developer.mention, inline=False)
+            
+            creator_user = interaction.guild.get_member(creator_id)
+            avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
+            work_embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
+            work_embed.add_field(name=f"{RTL}المستلم", value=assigned_developer.mention, inline=False)
+            work_embed.set_footer(text="Gestax HQ • In Progress")
             
             if thread_id and status in ['IN_PROGRESS', 'SUSPENDED']:
                 thread = interaction.guild.get_thread(thread_id)
@@ -268,13 +282,13 @@ class AssigneeSelectView(discord.ui.View):
         self.add_item(AssigneeSelect(msg_id))
 
 # --------------------------------------------------------
-# 🔘 أزرار التذاكر المعلقة (جديد)
+# 🔘 أزرار التذاكر المعلقة
 # --------------------------------------------------------
 class SuspendedTicketOpsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="نزع التعليق (إعادة للانتظار) 🔙", style=discord.ButtonStyle.primary, custom_id="btn_unsuspend")
+    @discord.ui.button(label="نزع التعليق 🔙", style=discord.ButtonStyle.primary, custom_id="btn_unsuspend")
     async def unsuspend_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         async with aiosqlite.connect(DB_FILE) as db:
@@ -284,12 +298,14 @@ class SuspendedTicketOpsView(discord.ui.View):
                 issue_num, creator_id, t_type, title, desc, dod, thread_id = row
 
             embed = discord.Embed(
-                title=f"⏳ #{issue_num} | {t_type} | {title}",
-                description=f"### الوصف:\n{desc}\n\n### 🎯 متطلبات الإنهاء (DoD):\n{dod}",
-                color=discord.Color.gold()
+                title=f"{RTL} ⏳ تذكرة #{issue_num} | {title}",
+                description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}",
+                color=0xF1C40F
             )
             creator_user = interaction.guild.get_member(creator_id)
-            embed.add_field(name="المنشئ", value=creator_user.mention if creator_user else "غير معروف", inline=False)
+            avatar_url = creator_user.avatar.url if creator_user and creator_user.avatar else interaction.user.default_avatar.url
+            embed.set_author(name=f"المنشئ: {creator_user.display_name if creator_user else 'غير معروف'}", icon_url=avatar_url)
+            embed.set_footer(text="Gestax HQ • Pending")
             
             pending_channel = bot.get_channel(PENDING_CHANNEL_ID)
             new_msg = await pending_channel.send(embed=embed, view=PersistentTicketOpsView())
@@ -354,7 +370,7 @@ class PersistentTicketOpsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="تعيين مهام 👤", style=discord.ButtonStyle.primary, custom_id="btn_global_assign")
+    @discord.ui.button(label="تعيين 👤", style=discord.ButtonStyle.primary, custom_id="btn_global_assign")
     async def assign_dev(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("اختر العضو من القائمة:", view=AssigneeSelectView(interaction.message.id), ephemeral=True)
 
@@ -362,7 +378,7 @@ class PersistentTicketOpsView(discord.ui.View):
     async def suspend_task(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SuspendModal(interaction.message.id))
 
-    @discord.ui.button(label="إنهاء المهمة ✅", style=discord.ButtonStyle.success, custom_id="btn_mark_done")
+    @discord.ui.button(label="إنهاء ✅", style=discord.ButtonStyle.success, custom_id="btn_mark_done")
     async def mark_done(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         async with aiosqlite.connect(DB_FILE) as db:
@@ -380,10 +396,11 @@ class PersistentTicketOpsView(discord.ui.View):
             done_channel = bot.get_channel(DONE_CHANNEL_ID)
             
             done_embed = discord.Embed(
-                title=f"🎉 #{issue_num} | {t_type} | {title}", 
-                description=f"### الوصف:\n{desc}\n\n### 🎯 متطلبات الإنهاء (DoD):\n{dod}", 
-                color=discord.Color.dark_theme()
+                title=f"{RTL} 🎉 مكتملة #{issue_num} | {title}", 
+                description=f"{RTL}**القسم:** {t_type}\n\n{RTL}**الوصف:**\n> {desc}\n\n{RTL}**🎯 متطلبات الإنهاء (DoD):**\n> {dod}", 
+                color=0x2ECC71 # أخضر نقي
             )
+            done_embed.set_footer(text=f"Gestax HQ • Completed • {datetime.datetime.now().strftime('%Y-%m-%d')}")
             
             new_msg = await done_channel.send(embed=done_embed, view=DoneTicketOpsView())
 
@@ -400,7 +417,7 @@ class PersistentTicketOpsView(discord.ui.View):
             await interaction.message.delete()
             await interaction.followup.send("✅ تم اعتماد التذكرة ونقلها لقناة المكتملة.", ephemeral=True)
 
-    @discord.ui.button(label="إغلاق إجباري ❌", style=discord.ButtonStyle.danger, custom_id="btn_global_force_close")
+    @discord.ui.button(label="إغلاق ❌", style=discord.ButtonStyle.danger, custom_id="btn_global_force_close")
     async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
             await interaction.response.send_message("❌ للإدارة فقط.", ephemeral=True)
@@ -457,7 +474,7 @@ async def on_ready():
     bot.add_view(InitialTicketBootstrapView())
     bot.add_view(PersistentTicketOpsView())
     bot.add_view(DoneTicketOpsView())
-    bot.add_view(SuspendedTicketOpsView()) # إضافة الأزرار الجديدة للذاكرة
+    bot.add_view(SuspendedTicketOpsView())
     
     if not archive_old_tickets_task.is_running(): archive_old_tickets_task.start()
     bot.loop.create_task(fake_web_server())
@@ -466,7 +483,11 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup_tickets(ctx):
-    embed = discord.Embed(title="💼 بوابة إدارة مهام فريق Gestax", description="اضغط لفتح تذكرة جديدة. سيُطلب منك تحديد نوع المهمة (برمجية، تصميم، إلخ).", color=discord.Color.blurple())
+    embed = discord.Embed(
+        title=f"{RTL} 💼 بوابة إدارة المهام", 
+        description=f"{RTL}اضغط لفتح تذكرة جديدة. سيُطلب منك تحديد نوع المهمة (برمجية، تصميم، إلخ).", 
+        color=0x2C3E50
+    )
     await ctx.send(embed=embed, view=InitialTicketBootstrapView())
     await ctx.message.delete()
 
