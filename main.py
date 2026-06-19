@@ -137,15 +137,6 @@ async def send_audit_log(guild: discord.Guild, user: discord.Member, action: str
     embed.set_footer(text=f"Gestax Security", icon_url=user.display_avatar.url)
     await log_channel.send(embed=embed)
 
-async def fake_web_server():
-    app = web.Application()
-    app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive! 🚀"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
 class GitHubAPI:
     @staticmethod
     async def create_issue(title: str, body: str, labels: list) -> int:
@@ -165,6 +156,21 @@ class GitHubAPI:
         async with aiohttp.ClientSession() as session:
             async with session.patch(url, json=payload, headers=headers) as resp:
                 return resp.status == 200
+
+# --------------------------------------------------------
+# 🌐 التعديل الوحشي: خادم الويب الخاص بـ Render
+# --------------------------------------------------------
+async def fake_web_server():
+    app = web.Application()
+    app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive on Render! 🚀"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render يعطينا البورت عبر المتغير PORT، وإذا لم نجده نستخدم 8080
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 [RENDER HEALTHCHECK] تم فتح المنفذ {port} بنجاح!")
 
 # ========================================================
 # 1️⃣ نظام المهام (التوافق التام: ديساكورد عربي - جيتهاب إنجليزي)
@@ -604,8 +610,9 @@ async def archive_old_tickets_task():
                 await tickets_collection.delete_one({"discord_msg_id": message.id})
                 await message.delete()
 
-@bot.event
-async def on_ready():
+# التعديل الجذري: استخدام setup_hook بدلاً من on_ready لضمان فتح المنفذ لـ Render فوراً
+async def setup_hook():
+    bot.loop.create_task(fake_web_server())
     bot.add_view(DashboardView()) 
     bot.add_view(InitialTicketBootstrapView())
     bot.add_view(BugBootstrapView())
@@ -613,8 +620,13 @@ async def on_ready():
     bot.add_view(DoneTicketOpsView())
     bot.add_view(SuspendedTicketOpsView())
     
-    if not archive_old_tickets_task.is_running(): archive_old_tickets_task.start()
-    bot.loop.create_task(fake_web_server())
+    if not archive_old_tickets_task.is_running(): 
+        archive_old_tickets_task.start()
+
+bot.setup_hook = setup_hook
+
+@bot.event
+async def on_ready():
     print(f"🔥 النظام الإداري المتقدم أونلاين! البوت: {bot.user}")
 
 @bot.command()
