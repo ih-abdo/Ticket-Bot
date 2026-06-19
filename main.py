@@ -89,7 +89,8 @@ class RoleAssignView(discord.ui.View):
 class DashboardMainSelect(discord.ui.Select):
     def __init__(self):
         options = [discord.SelectOption(label=name, value=key) for key, name in PERM_NAMES.items()]
-        super().__init__(placeholder="🛠️ اختر الصلاحية التي تريد ضبط رتبها...", options=options)
+        # تمت إضافة custom_id هنا لحل المشكلة
+        super().__init__(custom_id="dashboard_main_select", placeholder="🛠️ اختر الصلاحية التي تريد ضبط رتبها...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         selected_perm = self.values[0]
