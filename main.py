@@ -15,13 +15,22 @@ GITHUB_REPO = os.getenv("GITHUB_REPO")
 MONGO_URI = os.getenv("MONGO_URI")
 
 # --- إعدادات القنوات ---
-BOOTSTRAP_CHANNEL_ID = int(os.getenv("CHANNEL_BOOTSTRAP_ID"))
-PENDING_CHANNEL_ID = int(os.getenv("CHANNEL_NEW_TICKETS_ID"))
-IN_PROGRESS_CHANNEL_ID = int(os.getenv("CHANNEL_IN_PROGRESS_ID"))
-SUSPENDED_CHANNEL_ID = int(os.getenv("CHANNEL_SUSPENDED_ID")) 
-DONE_CHANNEL_ID = int(os.getenv("CHANNEL_DONE_ID"))
-ARCHIVE_CHANNEL_ID = int(os.getenv("CHANNEL_ARCHIVE_ID"))
-LOG_CHANNEL_ID = int(os.getenv("CHANNEL_LOG_ID")) 
+BOOTSTRAP_CHANNEL_ID = int(os.getenv("CHANNEL_BOOTSTRAP_ID", 0))
+PENDING_CHANNEL_ID = int(os.getenv("CHANNEL_NEW_TICKETS_ID", 0))
+IN_PROGRESS_CHANNEL_ID = int(os.getenv("CHANNEL_IN_PROGRESS_ID", 0))
+SUSPENDED_CHANNEL_ID = int(os.getenv("CHANNEL_SUSPENDED_ID", 0)) 
+DONE_CHANNEL_ID = int(os.getenv("CHANNEL_DONE_ID", 0))
+ARCHIVE_CHANNEL_ID = int(os.getenv("CHANNEL_ARCHIVE_ID", 0))
+LOG_CHANNEL_ID = int(os.getenv("CHANNEL_LOG_ID", 0)) 
+
+# --- إعدادات الرتب (RBAC) ---
+def get_env_id(key):
+    val = os.getenv(key)
+    return int(val) if val and val.isdigit() else 0
+
+ROLE_LEAD_ID = get_env_id("ROLE_LEAD_ID")
+ROLE_DEV_ID = get_env_id("ROLE_DEV_ID")
+ROLE_REPORTER_ID = get_env_id("ROLE_REPORTER_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -31,99 +40,38 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --------------------------------------------------------
-# 🗄️ إعداد MongoDB
+# 🗄️ إعداد MongoDB (للتذاكر فقط - تخلصنا من إعدادات الصلاحيات)
 # --------------------------------------------------------
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["gestax_system"]
 tickets_collection = db["tickets"]
-configs_collection = db["server_configs"] 
 
 RTL = "\u202b"
 WIDTH_HACK = "\u2800" * 45  
 
 # --------------------------------------------------------
-# 🛡️ نظام الصلاحيات شديد الدقة (Granular Permissions)
+# 🛡️ نظام الصلاحيات المعتمد على الأدوار (RBAC Logic)
 # --------------------------------------------------------
-PERM_NAMES = {
-    "create_task": "📝 فتح تذاكر المهام",
-    "create_bug": "🐞 الإبلاغ عن الأخطاء",
-    "assign_ticket": "👤 تعيين المطورين",
-    "suspend_ticket": "⏸️ تعليق التذاكر",
-    "unsuspend_ticket": "▶️ إلغاء التعليق",
-    "force_close": "❌ الحذف والإغلاق الإجباري",
-    "archive_ticket": "📁 الأرشفة اليدوية"
-}
+def is_admin(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator or member.guild.owner_id == member.id
 
-async def get_guild_config(guild_id: int):
-    config = await configs_collection.find_one({"guild_id": guild_id})
-    if not config:
-        config = {"guild_id": guild_id, "perms": {k: [] for k in PERM_NAMES.keys()}}
-        await configs_collection.insert_one(config)
-    return config
+def has_role(member: discord.Member, role_id: int) -> bool:
+    if role_id == 0: return False
+    return any(role.id == role_id for role in member.roles)
 
-async def check_permission(guild_id: int, user: discord.Member, perm_type: str) -> bool:
-    if user.guild.owner_id == user.id or user.guild_permissions.administrator:
-        return True
-    config = await get_guild_config(guild_id)
-    allowed_roles = config.get("perms", {}).get(perm_type, [])
-    user_role_ids = [role.id for role in user.roles]
-    return any(role_id in allowed_roles for role_id in user_role_ids)
+def is_lead(member: discord.Member) -> bool:
+    return is_admin(member) or has_role(member, ROLE_LEAD_ID)
 
-# --- لوحة التحكم المتطورة ---
-class RoleAssignView(discord.ui.View):
-    def __init__(self, guild_id: int, perm_key: str):
-        super().__init__(timeout=120)
-        self.guild_id = guild_id
-        self.perm_key = perm_key
+def is_dev(member: discord.Member) -> bool:
+    return is_lead(member) or has_role(member, ROLE_DEV_ID)
 
-    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="اختر الرتب المسموح لها بهذا الإجراء...", min_values=0, max_values=10)
-    async def select_roles(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        role_ids = [role.id for role in select.values]
-        await configs_collection.update_one(
-            {"guild_id": self.guild_id}, 
-            {"$set": {f"perms.{self.perm_key}": role_ids}}, 
-            upsert=True
-        )
-        await interaction.response.send_message(f"✅ تم تحديث صلاحية **{PERM_NAMES[self.perm_key]}** بنجاح.", ephemeral=True)
+def can_create_task(member: discord.Member) -> bool:
+    # المبلغون والمطورون والقادة يمكنهم فتح تذاكر مهام
+    return is_dev(member) or has_role(member, ROLE_REPORTER_ID)
 
-class DashboardMainSelect(discord.ui.Select):
-    def __init__(self):
-        options = [discord.SelectOption(label=name, value=key) for key, name in PERM_NAMES.items()]
-        # تمت إضافة custom_id هنا لحل المشكلة
-        super().__init__(custom_id="dashboard_main_select", placeholder="🛠️ اختر الصلاحية التي تريد ضبط رتبها...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_perm = self.values[0]
-        perm_name = PERM_NAMES[selected_perm]
-        embed = discord.Embed(
-            title=f"ضبط صلاحية: {perm_name}", 
-            description="حدد الرتب التي يحق لها القيام بهذا الإجراء من القائمة أدناه.\n*(لحذف كل الرتب، قم بإلغاء التحديد واضغط خارج القائمة)*",
-            color=0x3498DB
-        )
-        await interaction.response.send_message(embed=embed, view=RoleAssignView(interaction.guild.id, selected_perm), ephemeral=True)
-
-class DashboardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(DashboardMainSelect())
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def dashboard(ctx):
-    """لوحة تحكم الصلاحيات الاحترافية"""
-    config = await get_guild_config(ctx.guild.id)
-    embed = discord.Embed(
-        title="🎛️ مركز تحكم الصلاحيات المتقدم (Gestax Command Center)",
-        description="هنا يمكنك تخصيص من يمكنه فعل ماذا بدقة متناهية. الإدارة العليا وصاحب السيرفر لديهم جميع الصلاحيات دائماً.\n\n**الوضع الحالي:**",
-        color=0x9B59B6
-    )
-    for key, name in PERM_NAMES.items():
-        roles = config.get("perms", {}).get(key, [])
-        role_mentions = " ".join([f"<@&{r}>" for r in roles]) if roles else "لا أحد (الإدارة فقط)"
-        embed.add_field(name=name, value=role_mentions, inline=False)
-
-    await ctx.send(embed=embed, view=DashboardView())
-    await ctx.message.delete()
+def can_create_bug(member: discord.Member) -> bool:
+    # الجميع (Everyone) مسموح لهم بفتح بلاغ خطأ
+    return True
 
 # --------------------------------------------------------
 # 📜 سجل النظام و GitHub API
@@ -135,7 +83,7 @@ async def send_audit_log(guild: discord.Guild, user: discord.Member, action: str
     embed.add_field(name="👤 بواسطة", value=user.mention, inline=True)
     embed.add_field(name="🎫 التذكرة", value=f"#{issue_num} | {title}", inline=True)
     if extra: embed.add_field(name="📝 التفاصيل", value=extra, inline=False)
-    embed.set_footer(text=f"Gestax Security", icon_url=user.display_avatar.url)
+    embed.set_footer(text=f"Gestax Security & Audit", icon_url=user.display_avatar.url)
     await log_channel.send(embed=embed)
 
 class GitHubAPI:
@@ -159,22 +107,20 @@ class GitHubAPI:
                 return resp.status == 200
 
 # --------------------------------------------------------
-# 🌐 التعديل الوحشي: خادم الويب الخاص بـ Render
+# 🌐 خادم الويب الخاص بـ Render
 # --------------------------------------------------------
 async def fake_web_server():
     app = web.Application()
     app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive on Render! 🚀"))
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Render يعطينا البورت عبر المتغير PORT، وإذا لم نجده نستخدم 8080
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"🌐 [RENDER HEALTHCHECK] تم فتح المنفذ {port} بنجاح!")
 
 # ========================================================
-# 1️⃣ نظام المهام (التوافق التام: ديساكورد عربي - جيتهاب إنجليزي)
+# 1️⃣ نظام المهام (Tasks)
 # ========================================================
 class TicketCreationModal(discord.ui.Modal):
     def __init__(self, cat_ar, cat_en, kind_ar, kind_en, urg_ar, urg_en, is_custom):
@@ -198,22 +144,18 @@ class TicketCreationModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
         final_cat_ar = self.custom_type.value.strip() if self.is_custom else self.cat_ar
         final_cat_en = self.custom_type.value.strip() if self.is_custom else self.cat_en
 
-        # جيتهاب يستقبل الإنجليزي فقط
         gh_labels = [final_cat_en, self.kind_en, self.urg_en]
         issue_body = f"Requested by: {interaction.user.name}\n\n**Description:**\n{self.ticket_desc.value}\n\n**DoD:**\n{self.ticket_dod.value}"
         
         issue_num = await GitHubAPI.create_issue(self.ticket_title.value, issue_body, gh_labels)
         if not issue_num:
-            await interaction.followup.send("❌ فشل فتح التذكرة في جيتهاب.", ephemeral=True)
-            return
+            return await interaction.followup.send("❌ فشل فتح التذكرة في جيتهاب.", ephemeral=True)
         
         formatted_body = f"**{RTL}📋 الوصف:**\n{RTL}{self.ticket_desc.value}\n\n**{RTL}🎯 متطلبات الإنهاء (DoD):**\n{RTL}{self.ticket_dod.value}"
         
-        # ديسكورد يعرض العربي فقط
         embed = discord.Embed(
             title=f"{RTL} ⏳ تذكرة #{issue_num} | {self.ticket_title.value}",
             description=f"{RTL}**القسم:** {final_cat_ar} | **النوع:** {self.kind_ar} | **الأولوية:** {self.urg_ar}\n\n{formatted_body}",
@@ -272,12 +214,10 @@ class TicketConfigView(discord.ui.View):
 
     @discord.ui.button(label="متابعة وكتابة التفاصيل ➡️", style=discord.ButtonStyle.success, row=3)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "create_task"):
-            await interaction.response.send_message("❌ لا تملك الصلاحية اللازمة لفتح تذاكر مهام.", ephemeral=True)
-            return
+        if not can_create_task(interaction.user):
+            return await interaction.response.send_message("❌ لا تملك صلاحية فتح تذاكر مهام.", ephemeral=True)
         if not self.cat_data or not self.kind_data or not self.urg_data:
-            await interaction.response.send_message("❌ يرجى اختيار القسم، النوع، ومدى الاستعجال أولاً!", ephemeral=True)
-            return
+            return await interaction.response.send_message("❌ يرجى اختيار القسم، النوع، ومدى الاستعجال أولاً!", ephemeral=True)
             
         is_custom = (self.cat_data[1] == "custom")
         await interaction.response.send_modal(TicketCreationModal(
@@ -292,13 +232,12 @@ class InitialTicketBootstrapView(discord.ui.View):
         super().__init__(timeout=None)
     @discord.ui.button(label="فتح تذكرة مهام 📝", style=discord.ButtonStyle.primary, custom_id="btn_open_standard")
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "create_task"):
-            await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
-            return
+        if not can_create_task(interaction.user):
+            return await interaction.response.send_message("❌ لا تملك صلاحية فتح المهام. (مخصصة للمطورين والمبلغين).", ephemeral=True)
         await interaction.response.send_message("⚙️ **إعداد التذكرة:** حدد الخيارات التوضيحية للمهمة:", view=TicketConfigView(), ephemeral=True)
 
 # ========================================================
-# 2️⃣ نظام البلاغات (Bugs)
+# 2️⃣ نظام البلاغات للجميع (Bugs - Everyone)
 # ========================================================
 class BugCreationModal(discord.ui.Modal):
     def __init__(self, urg_ar, urg_en):
@@ -363,12 +302,10 @@ class BugConfigView(discord.ui.View):
 
     @discord.ui.button(label="متابعة لكتابة التفاصيل ➡️", style=discord.ButtonStyle.danger, row=1)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "create_bug"):
-            await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
-            return
+        if not can_create_bug(interaction.user):
+            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
         if not self.urg_data:
-            await interaction.response.send_message("❌ حدد الخطورة أولاً!", ephemeral=True)
-            return
+            return await interaction.response.send_message("❌ حدد الخطورة أولاً!", ephemeral=True)
         await interaction.response.send_modal(BugCreationModal(self.urg_data[0], self.urg_data[1]))
 
 class BugBootstrapView(discord.ui.View):
@@ -376,9 +313,8 @@ class BugBootstrapView(discord.ui.View):
         super().__init__(timeout=None)
     @discord.ui.button(label="إبلاغ عن عيب برمجي (Bug) 🐞", style=discord.ButtonStyle.danger, custom_id="btn_open_bug")
     async def open_bug(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "create_bug"):
-            await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
-            return
+        if not can_create_bug(interaction.user):
+            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
         await interaction.response.send_message("⚙️ حدد مستوى الخطورة:", view=BugConfigView(), ephemeral=True)
 
 # ========================================================
@@ -421,13 +357,20 @@ class SuspendModal(discord.ui.Modal, title="سبب تعليق التذكرة"):
 
 class AssigneeSelect(discord.ui.UserSelect):
     def __init__(self, msg_id: int):
-        super().__init__(custom_id=f"assign_select_menu:{msg_id}", placeholder="اختر المطور...", min_values=1, max_values=1)
+        super().__init__(custom_id=f"assign_select_menu:{msg_id}", placeholder="اختر المطور لاستلام المهمة...", min_values=1, max_values=1)
         self.msg_id = msg_id
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         dev = self.values[0]
         if dev.bot: return await interaction.followup.send("❌ لا يمكنك تعيين روبوت!", ephemeral=True)
+
+        # التحقق الجراحي: المدير يعين أي شخص، المطور يعين نفسه فقط.
+        if not is_lead(interaction.user):
+            if not is_dev(interaction.user):
+                return await interaction.followup.send("❌ لا تملك الصلاحية.", ephemeral=True)
+            if dev.id != interaction.user.id:
+                return await interaction.followup.send("❌ كمطور، يمكنك فقط استلام المهام لنفسك. الإدارة هي من تعين الآخرين.", ephemeral=True)
 
         ticket = await tickets_collection.find_one({"discord_msg_id": self.msg_id})
         if not ticket: return
@@ -461,8 +404,8 @@ class AssigneeSelect(discord.ui.UserSelect):
             try: await interaction.message.delete()
             except Exception: pass
             
-        await send_audit_log(interaction.guild, interaction.user, "تعيين مطور 👨‍💻", ticket['github_issue_num'], ticket['title'], 0x9B59B6, f"**المستلم:** {dev.mention}")
-        await interaction.followup.send("🎯 تم تحديث التذكرة.", ephemeral=True)
+        await send_audit_log(interaction.guild, interaction.user, "تسليم مهمة 👨‍💻", ticket['github_issue_num'], ticket['title'], 0x9B59B6, f"**المستلم:** {dev.mention}")
+        await interaction.followup.send("🎯 تم تحديث التذكرة وبدء العمل.", ephemeral=True)
 
 class AssigneeSelectView(discord.ui.View):
     def __init__(self, msg_id: int):
@@ -475,8 +418,8 @@ class SuspendedTicketOpsView(discord.ui.View):
 
     @discord.ui.button(label="نزع التعليق 🔙", style=discord.ButtonStyle.primary, custom_id="btn_unsuspend")
     async def unsuspend_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "unsuspend_ticket"):
-            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
+        if not is_dev(interaction.user):
+            return await interaction.response.send_message("❌ لا تملك الصلاحية (مخصصة للمطورين والإدارة).", ephemeral=True)
             
         await interaction.response.defer(ephemeral=True)
         ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
@@ -495,7 +438,7 @@ class SuspendedTicketOpsView(discord.ui.View):
         if ticket['thread_id']:
             try:
                 thread = interaction.guild.get_thread(ticket['thread_id'])
-                if thread: await thread.send("▶️ تم نزع التعليق.")
+                if thread: await thread.send("▶️ تم نزع التعليق، التذكرة في الانتظار مجدداً.")
             except: pass
 
         await tickets_collection.update_one({"discord_msg_id": interaction.message.id}, {"$set": {"discord_msg_id": new_msg.id, "status": "PENDING"}})
@@ -505,8 +448,8 @@ class SuspendedTicketOpsView(discord.ui.View):
 
     @discord.ui.button(label="إغلاق إجباري ❌", style=discord.ButtonStyle.danger, custom_id="btn_suspend_force_close")
     async def force_close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "force_close"):
-            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
+        if not is_lead(interaction.user):
+            return await interaction.response.send_message("❌ عملية الحذف والإغلاق الإجباري حصراً للإدارة (Lead).", ephemeral=True)
         await handle_force_close(interaction)
 
 class DoneTicketOpsView(discord.ui.View):
@@ -515,30 +458,30 @@ class DoneTicketOpsView(discord.ui.View):
 
     @discord.ui.button(label="أرشفة التذكرة 📁", style=discord.ButtonStyle.secondary, custom_id="btn_archive_done")
     async def archive_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "archive_ticket"):
-            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
+        if not is_lead(interaction.user):
+            return await interaction.response.send_message("❌ الأرشفة اليدوية حصراً للإدارة (Lead).", ephemeral=True)
             
         ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
         await bot.get_channel(ARCHIVE_CHANNEL_ID).send(embed=interaction.message.embeds[0])
         await tickets_collection.delete_one({"discord_msg_id": interaction.message.id})
         if ticket: await send_audit_log(interaction.guild, interaction.user, "أرشفة يدوية 📁", ticket['github_issue_num'], ticket['title'], 0x95A5A6)
         await interaction.message.delete()
-        await interaction.response.send_message("📁 تمت الأرشفة.", ephemeral=True)
+        await interaction.response.send_message("📁 تمت الأرشفة بنجاح.", ephemeral=True)
 
 class PersistentTicketOpsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="تعيين 👤", style=discord.ButtonStyle.primary, custom_id="btn_global_assign")
+    @discord.ui.button(label="استلام/تعيين 👤", style=discord.ButtonStyle.primary, custom_id="btn_global_assign")
     async def assign_dev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "assign_ticket"):
+        if not is_dev(interaction.user):
             return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
-        await interaction.response.send_message("اختر المطور:", view=AssigneeSelectView(interaction.message.id), ephemeral=True)
+        await interaction.response.send_message("اختر المطور (المطورون يختارون أنفسهم فقط):", view=AssigneeSelectView(interaction.message.id), ephemeral=True)
 
     @discord.ui.button(label="تعليق ⏸️", style=discord.ButtonStyle.secondary, custom_id="btn_global_suspend")
     async def suspend_task(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "suspend_ticket"):
-            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
+        if not is_dev(interaction.user):
+            return await interaction.response.send_message("❌ لا تملك الصلاحية (مخصصة للمطورين والإدارة).", ephemeral=True)
         await interaction.response.send_modal(SuspendModal(interaction.message.id))
 
     @discord.ui.button(label="إنهاء ✅", style=discord.ButtonStyle.success, custom_id="btn_mark_done")
@@ -547,9 +490,8 @@ class PersistentTicketOpsView(discord.ui.View):
         ticket = await tickets_collection.find_one({"discord_msg_id": interaction.message.id})
         if not ticket: return
 
-        has_force = await check_permission(interaction.guild.id, interaction.user, "force_close")
-        if not has_force and interaction.user.id != ticket['assignee_id']:
-            return await interaction.followup.send("❌ فقط المطور المسؤول أو الإدارة العليا يمكنهم الإنهاء.", ephemeral=True)
+        if not is_lead(interaction.user) and interaction.user.id != ticket['assignee_id']:
+            return await interaction.followup.send("❌ المطور المسؤول عن المهمة والإدارة العليا فقط من يمكنهم اعتماد الإنهاء.", ephemeral=True)
 
         await GitHubAPI.close_issue(ticket['github_issue_num'])
         done_embed = discord.Embed(
@@ -565,19 +507,19 @@ class PersistentTicketOpsView(discord.ui.View):
             try:
                 thread = interaction.guild.get_thread(ticket['thread_id'])
                 if thread:
-                    await thread.send("🔒 **مكتمل:** تم إنهاء المهمة وقفل الغرفة.")
+                    await thread.send("🔒 **مكتمل:** تم إنجاز المهمة وإغلاق الغرفة.")
                     await thread.edit(archived=True, locked=True)
             except Exception: pass
 
         await tickets_collection.update_one({"discord_msg_id": interaction.message.id}, {"$set": {"discord_msg_id": new_msg.id, "status": "DONE"}})
         await send_audit_log(interaction.guild, interaction.user, "إنهاء واعتماد ✅", ticket['github_issue_num'], ticket['title'], 0x2ECC71)
         await interaction.message.delete()
-        await interaction.followup.send("✅ اكتملت المهمة.", ephemeral=True)
+        await interaction.followup.send("✅ اكتملت المهمة وتم تسجيل الإنجاز.", ephemeral=True)
 
     @discord.ui.button(label="إغلاق ❌", style=discord.ButtonStyle.danger, custom_id="btn_global_force_close")
     async def force_close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await check_permission(interaction.guild.id, interaction.user, "force_close"):
-            return await interaction.response.send_message("❌ لا تملك الصلاحية.", ephemeral=True)
+        if not is_lead(interaction.user):
+            return await interaction.response.send_message("❌ عملية الحذف والإغلاق الإجباري حصراً للإدارة (Lead).", ephemeral=True)
         await handle_force_close(interaction)
 
 async def handle_force_close(interaction: discord.Interaction):
@@ -590,10 +532,10 @@ async def handle_force_close(interaction: discord.Interaction):
                 thread = interaction.guild.get_thread(ticket['thread_id'])
                 if thread: await thread.edit(archived=True, locked=True)
             except Exception: pass
-        await send_audit_log(interaction.guild, interaction.user, "إغلاق إجباري 🗑️", ticket['github_issue_num'], ticket['title'], 0x992D22)
+        await send_audit_log(interaction.guild, interaction.user, "حذف وإغلاق إجباري 🗑️", ticket['github_issue_num'], ticket['title'], 0x992D22)
         await tickets_collection.delete_one({"discord_msg_id": interaction.message.id})
         await interaction.message.delete()
-        await interaction.followup.send("🗑️ تم الحذف.", ephemeral=True)
+        await interaction.followup.send("🗑️ تم الحذف والإغلاق من السجلات.", ephemeral=True)
 
 # --------------------------------------------------------
 # 🚀 الإقـلاع والأوامر المخصصة
@@ -611,16 +553,18 @@ async def archive_old_tickets_task():
                 await tickets_collection.delete_one({"discord_msg_id": message.id})
                 await message.delete()
 
-# التعديل الجذري: استخدام setup_hook بدلاً من on_ready لضمان فتح المنفذ لـ Render فوراً
 async def setup_hook():
+    # 1. إقلاع خادم الويب الخاص بـ Render فورا!
     bot.loop.create_task(fake_web_server())
-    bot.add_view(DashboardView()) 
+    
+    # 2. إضافة الأزرار الدائمة
     bot.add_view(InitialTicketBootstrapView())
     bot.add_view(BugBootstrapView())
     bot.add_view(PersistentTicketOpsView())
     bot.add_view(DoneTicketOpsView())
     bot.add_view(SuspendedTicketOpsView())
     
+    # 3. تشغيل مهمة التنظيف الآلي
     if not archive_old_tickets_task.is_running(): 
         archive_old_tickets_task.start()
 
@@ -628,19 +572,19 @@ bot.setup_hook = setup_hook
 
 @bot.event
 async def on_ready():
-    print(f"🔥 النظام الإداري المتقدم أونلاين! البوت: {bot.user}")
+    print(f"🔥 النظام الإداري المتقدم (RBAC) أونلاين! البوت: {bot.user}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup_tickets(ctx):
-    embed = discord.Embed(title=f"{RTL} 💼 بوابة إدارة المهام", description=f"{RTL}اضغط لفتح تذكرة جديدة.", color=0x2C3E50)
+    embed = discord.Embed(title=f"{RTL} 💼 بوابة إدارة المهام (للمطورين والمبلغين)", description=f"{RTL}اضغط لفتح تذكرة برمجية جديدة أو اقتراح ميزة.", color=0x2C3E50)
     await ctx.send(embed=embed, view=InitialTicketBootstrapView())
     await ctx.message.delete()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup_bugs(ctx):
-    embed = discord.Embed(title=f"{RTL} 🐞 بوابة الإبلاغ عن الأخطاء", description=f"{RTL}اضغط لفتح تذكرة للإبلاغ عن مشكلة.", color=0xC0392B)
+    embed = discord.Embed(title=f"{RTL} 🐞 بوابة الإبلاغ عن الأخطاء (للجميع)", description=f"{RTL}هل واجهتك مشكلة؟ اضغط هنا للتبليغ عنها ليتم حلها.", color=0xC0392B)
     await ctx.send(embed=embed, view=BugBootstrapView())
     await ctx.message.delete()
 
