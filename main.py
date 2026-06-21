@@ -1,6 +1,7 @@
 import os
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands  # تمت الإضافة لدعم أوامر السلاش وصلاحياتها
 import aiohttp
 from aiohttp import web 
 import motor.motor_asyncio
@@ -37,6 +38,7 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
+# تركنا الـ prefix كما هو تحسباً لأي توافقية خلفية، ولكن الاعتماد الآن على أوامر السلاش
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --------------------------------------------------------
@@ -567,6 +569,13 @@ async def setup_hook():
     # 3. تشغيل مهمة التنظيف الآلي
     if not archive_old_tickets_task.is_running(): 
         archive_old_tickets_task.start()
+        
+    # 4. مزامنة أوامر السلاش مع سيرفرات ديسكورد
+    try:
+        synced = await bot.tree.sync()
+        print(f"🔄 تم مزامنة {len(synced)} أمر سلاش (Slash Command) بنجاح.")
+    except Exception as e:
+        print(f"❌ فشل مزامنة أوامر السلاش: {e}")
 
 bot.setup_hook = setup_hook
 
@@ -574,18 +583,25 @@ bot.setup_hook = setup_hook
 async def on_ready():
     print(f"🔥 النظام الإداري المتقدم (RBAC) أونلاين! البوت: {bot.user}")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_tickets(ctx):
+# --------------------------------------------------------
+# 💻 أوامر السلاش الحديثة (Slash Commands)
+# --------------------------------------------------------
+@bot.tree.command(name="setup_tickets", description="نشر قائمة إنشاء تذاكر المهام (للمسؤولين فقط)")
+@app_commands.default_permissions(administrator=True)
+async def setup_tickets(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{RTL} 💼 بوابة إدارة المهام (للمطورين والمبلغين)", description=f"{RTL}اضغط لفتح تذكرة برمجية جديدة أو اقتراح ميزة.", color=0x2C3E50)
-    await ctx.send(embed=embed, view=InitialTicketBootstrapView())
-    await ctx.message.delete()
+    # إرسال البطاقة إلى القناة ليراها الجميع
+    await interaction.channel.send(embed=embed, view=InitialTicketBootstrapView())
+    # الرد المخفي الإجباري لتأكيد نجاح الأمر لك وحدك
+    await interaction.response.send_message("✅ تم نشر بوابة التذاكر في هذه القناة بنجاح.", ephemeral=True)
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_bugs(ctx):
+@bot.tree.command(name="setup_bugs", description="نشر قائمة الإبلاغ عن الأخطاء (للجميع)")
+@app_commands.default_permissions(administrator=True)
+async def setup_bugs(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{RTL} 🐞 بوابة الإبلاغ عن الأخطاء (للجميع)", description=f"{RTL}هل واجهتك مشكلة؟ اضغط هنا للتبليغ عنها ليتم حلها.", color=0xC0392B)
-    await ctx.send(embed=embed, view=BugBootstrapView())
-    await ctx.message.delete()
+    # إرسال البطاقة إلى القناة ليراها الجميع
+    await interaction.channel.send(embed=embed, view=BugBootstrapView())
+    # الرد المخفي الإجباري
+    await interaction.response.send_message("✅ تم نشر بوابة الأخطاء في هذه القناة بنجاح.", ephemeral=True)
 
 bot.run(TOKEN)
