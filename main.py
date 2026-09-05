@@ -362,8 +362,15 @@ class SuspendModal(discord.ui.Modal, title="سبب تعليق التذكرة"):
                 thread = interaction.guild.get_thread(ticket['thread_id'])
                 if thread: await thread.send("🛑 **تنبيه:** تم تعليق العمل على هذه المهمة ونقلها للانتظار.")
             except: pass
+            
         await send_audit_log(interaction.guild, interaction.user, "تعليق تذكرة 🛑", ticket['github_issue_num'], ticket['title'], 0xE74C3C, f"**السبب:** {self.reason.value}")
-        await interaction.message.delete()
+        # التعديل هنا: جلب الرسالة الأصلية وحذفها
+        try:
+            original_msg = await interaction.channel.fetch_message(self.msg_id)
+            await original_msg.delete()
+        except Exception:
+            pass
+            
         await interaction.followup.send("⏸️ تم النقل لقناة التعليق.", ephemeral=True)
 
 class AssigneeSelect(discord.ui.UserSelect):
@@ -396,12 +403,20 @@ class AssigneeSelect(discord.ui.UserSelect):
         work_embed.add_field(name=f"{RTL}المستلم", value=dev.mention, inline=False)
         work_embed.set_footer(text=f"Gestax HQ • In Progress{WIDTH_HACK}")
         
+        # جلب الرسالة الأصلية من القناة
+        try:
+            original_msg = await interaction.channel.fetch_message(self.msg_id)
+        except Exception:
+            original_msg = None
+
         if ticket['thread_id'] and ticket['status'] in ['IN_PROGRESS', 'SUSPENDED']:
             thread = interaction.guild.get_thread(ticket['thread_id'])
             if thread:
                 await thread.add_user(dev)
                 await thread.send(f"🔄 تم تسليم التذكرة للمطور {dev.mention}.")
-            await interaction.message.edit(embed=work_embed)
+            # تعديل الرسالة الأصلية وليس القائمة المخفية
+            if original_msg:
+                await original_msg.edit(embed=work_embed)
             await tickets_collection.update_one({"discord_msg_id": self.msg_id}, {"$set": {"assignee_id": dev.id, "status": "IN_PROGRESS"}})
         else:
             in_progress_channel = bot.get_channel(IN_PROGRESS_CHANNEL_ID)
@@ -412,8 +427,10 @@ class AssigneeSelect(discord.ui.UserSelect):
             await thread.add_user(dev)
             await thread.send(f"⚠️ مساحة عمل سرية لمناقشة #{ticket['github_issue_num']}.")
             await tickets_collection.update_one({"discord_msg_id": self.msg_id}, {"$set": {"discord_msg_id": new_msg.id, "assignee_id": dev.id, "thread_id": thread.id, "status": "IN_PROGRESS"}})
-            try: await interaction.message.delete()
-            except Exception: pass
+            # حذف الرسالة الأصلية بشكل آمن
+            if original_msg:
+                try: await original_msg.delete()
+                except Exception: pass
             
         await send_audit_log(interaction.guild, interaction.user, "تسليم مهمة 👨‍💻", ticket['github_issue_num'], ticket['title'], 0x9B59B6, f"**المستلم:** {dev.mention}")
         await interaction.followup.send("🎯 تم تحديث التذكرة وبدء العمل.", ephemeral=True)
