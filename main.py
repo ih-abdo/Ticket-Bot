@@ -109,11 +109,20 @@ class GitHubAPI:
                 return resp.status == 200
 
 # --------------------------------------------------------
-# 🌐 خادم الويب الخاص بـ Render
+# 🌐 خادم الويب الخاص بـ Render + فحص بقاء قاعدة البيانات مستيقظة
 # --------------------------------------------------------
+async def ping_handler(request):
+    try:
+        # إرسال أمر خفيف جداً لـ MongoDB لإبقائها مستيقظة
+        await mongo_client.admin.command('ping')
+        return web.json_response({"status": "ok", "database": "connected"})
+    except Exception as e:
+        return web.json_response({"status": "error", "detail": str(e)}, status=500)
+
 async def fake_web_server():
     app = web.Application()
     app.router.add_get('/', lambda request: web.Response(text="Gestax Discord Bot is Alive on Render! 🚀"))
+    app.router.add_get('/ping', ping_handler)  # مسار الفحص المخصص لخدمات Pinging
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
